@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Italy Aerial (Zarr) — geolibre</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<link href="https://cdn.jsdelivr.net/npm/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; }
+  #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+  .panel {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 1;
+    background: #fff;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    padding: 10px 12px;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: min(280px, calc(100vw - 80px));
+  }
+  .panel h1 { font-size: 14px; margin: 0 0 4px; }
+  .panel .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+  .panel .muted { color: #666; font-size: 12px; }
+  .panel a { color: #0366d6; }
+  #status { color: #555; font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <h1>Italy aerial imagery</h1>
+  <div class="muted">
+    Read straight from a
+    <a href="https://data.source.coop/mindearth/italy-aerial/italy-aerial.zarr" target="_blank" rel="noopener">Zarr v3 store</a>
+    in the browser (range requests + zstd) &mdash; no tile server.
+  </div>
+  <div class="row"><label for="opacity">Opacity</label><input id="opacity" type="range" min="0" max="1" step="0.05" value="1" /></div>
+  <div class="row"><label for="basemap">Basemap</label><input id="basemap" type="checkbox" checked /></div>
+  <div id="status">Loading metadata…</div>
+</div>
+
+<script>
+const STORE = 'https://data.source.coop/mindearth/italy-aerial/italy-aerial.zarr';
+const TILE = 256;
+const WORLD = 40075016.68557849;       // Web Mercator circumference (m)
+const ORIGIN = WORLD / 2;
+const MAX_ZOOM = 18;                    // level 0 resolution (0.597 m/px) == z18
+const EMPTY = 0xFFFFFFFFFFFFFFFFn;      // sharding_indexed marker for a missing inner chunk
+
+const statusEl = document.getElementById('status');
+let pending = 0, failed = 0;
+function updateStatus() {
+  statusEl.textContent = pending ? `Loading ${pending} chunk${pending > 1 ? 's' : ''}…` :
+    failed ? `${failed} chunk request${failed > 1 ? 's' : ''} failed` : 'Idle';
+}
+
+// ---------- Zarr metadata ----------
+// levels[k]: array geometry of /k/rgba, resolution = res0 * 2^k
+const levels = [];
+async function loadMetadata() {
+  const root = await (await fetch(`${STORE}/zarr.json`)).json();
+  const layout = root.attributes.multiscales.layout;
+  const bbox = root.attributes['spatial:bbox'];   // [xmin, ymin, xmax, ymax] in EPSG:3857
+  await Promise.all(layout.map(async (l, k) => {
+    const j = await (await fetch(`${STORE}/${l.asset}/zarr.json`)).json();
+    const m = j.consolidated_metadata.metadata.rgba;
+    const sh = m.codecs.find(c => c.name === 'sharding_indexed').configuration;
+    const comp = sh.codecs.find(c => c.name === 'zstd' || c.name === 'blosc');
+    if (!comp || (comp.name === 'blosc' && (comp.configuration.cname !== 'zstd' || comp.configuration.typesize !== 1)))
+      throw new Error(`unsupported inner codecs at level ${k}: ${JSON.stringify(sh.codecs)}`);
+    const t = l['spatial:transform'];
+    levels[k] = {
+      asset: l.asset,
+      res: t[0], x0: t[2], y0: t[5],
+      shard: m.chunk_grid.configuration.chunk_shape,   // [bands, rows, cols]
+      inner: sh.chunk_shape,
+      codec: comp.name,
+    };
+  }));
+  return bbox;
+}
+
+// ---------- Chunk reading ----------
+async function getRange(url, range) {
+  const r = await fetch(url, { headers: { Range: range } });
+  if (r.status === 404) return null;
+  if (!r.ok && r.status !== 206) throw new Error(`${r.status} ${url}`);
+  return new Uint8Array(await r.arrayBuffer());
+}
+
+const shardIndexCache = new Map();   // url -> Promise<DataView|null>
+function shardIndex(url, nInner) {
+  if (!shardIndexCache.has(url)) {
+    const p = getRange(url, `bytes=-${nInner * 16 + 4}`).then(b => b && new DataView(b.buffer, b.byteOffset, nInner * 16));
+    p.catch(() => shardIndexCache.delete(url));
+    shardIndexCache.set(url, p);
+  }
+  return shardIndexCache.get(url);
+}
+
+// Fetch + decode one inner chunk of one band-group. Returns Uint8Array (ib*iy*ix) or null if empty.
+async function readInner(L, bandChunk, row, col) {
+  const [cb, cy, cx] = L.shard, [ib, iy, ix] = L.inner;
+  const ny = cy / iy, nx = cx / ix;
+  const sy = Math.floor(row / ny), sx = Math.floor(col / nx);
+  const url = `${STORE}/${L.asset}/rgba/c/${Math.floor(bandChunk * ib / cb)}/${sy}/${sx}`;
+  const within = (((bandChunk * ib) % cb) / ib * ny + (row - sy * ny)) * nx + (col - sx * nx);
+  const idx = await shardIndex(url, (cb / ib) * ny * nx);
+  if (!idx) return null;
+  const off = idx.getBigUint64(within * 16, true), len = idx.getBigUint64(within * 16 + 8, true);
+  if (off === EMPTY && len === EMPTY) return null;
+  const comp = await getRange(url, `bytes=${off}-${off + len - 1n}`);
+  if (!comp) return null;
+  return L.codec === 'blosc' ? bloscZstdDecode(comp) : fzstd.decompress(comp);
+}
+
+// Minimal Blosc1 frame decoder: zstd compressor, typesize 1 (so byte-shuffle is a no-op, one stream per block).
+function bloscZstdDecode(src) {
+  const dv = new DataView(src.buffer, src.byteOffset, src.byteLength);
+  const flags = src[2], nbytes = dv.getUint32(4, true), blocksize = dv.getUint32(8, true);
+  if (src[3] !== 1) throw new Error('blosc typesize != 1');
+  if (flags & 0x2) return src.slice(16, 16 + nbytes);               // memcpy'd
+  if ((flags >> 5) !== 4) throw new Error('blosc compressor is not zstd');
+  const out = new Uint8Array(nbytes), nblocks = Math.ceil(nbytes / blocksize);
+  for (let b = 0; b < nblocks; b++) {
+    let p = dv.getUint32(16 + 4 * b, true);
+    const len = Math.min(blocksize, nbytes - b * blocksize);
+    const csize = dv.getInt32(p, true); p += 4;
+    out.set(csize === len ? src.subarray(p, p + len) : fzstd.decompress(src.subarray(p, p + csize)), b * blocksize);
+  }
+  return out;
+}
+
+// Decoded chunks as ImageBitmaps (RGBA), LRU cached. null = empty chunk.
+const chunkCache = new Map();
+const CACHE_MAX = 48;
+function getChunk(k, row, col) {
+  const key = `${k}/${row}/${col}`;
+  if (chunkCache.has(key)) {
+    const v = chunkCache.get(key); chunkCache.delete(key); chunkCache.set(key, v); return v;
+  }
+  const p = (async () => {
+    const L = levels[k], [, iy, ix] = L.inner, nb = L.inner[0];
+    const groups = await Promise.all(Array.from({ length: 4 / nb }, (_, g) => readInner(L, g, row, col)));
+    if (groups.some(g => !g)) return null;
+    const n = iy * ix, rgba = new Uint8ClampedArray(n * 4);
+    for (let b = 0; b < 4; b++) {
+      const src = nb === 4 ? groups[0].subarray(b * n, (b + 1) * n) : groups[b];
+      for (let i = 0, o = b; i < n; i++, o += 4) rgba[o] = src[i];
+    }
+    return createImageBitmap(new ImageData(rgba, ix, iy), { premultiplyAlpha: 'none' });
+  })();
+  p.catch(() => chunkCache.delete(key));
+  chunkCache.set(key, p);
+  if (chunkCache.size > CACHE_MAX) {
+    const [oldKey, old] = chunkCache.entries().next().value;
+    chunkCache.delete(oldKey);
+    old.then(bm => bm && bm.close(), () => {});
+  }
+  return p;
+}
+
+// ---------- XYZ tile protocol ----------
+async function renderTile(z, x, y, signal) {
+  const k = Math.min(Math.max(MAX_ZOOM - z, 0), levels.length - 1);
+  const L = levels[k], [, iy, ix] = L.inner;
+  const size = WORLD / 2 ** z;
+  const mx0 = -ORIGIN + x * size, my1 = ORIGIN - y * size;
+  // Pixel window of this tile in level k (fractional; tiles aren't aligned to the array above level 0)
+  const px0 = (mx0 - L.x0) / L.res, py0 = (L.y0 - my1) / L.res, pw = size / L.res;
+
+  const canvas = new OffscreenCanvas(TILE, TILE);
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  const scale = TILE / pw;
+  const c0 = Math.floor(px0 / ix), c1 = Math.floor((px0 + pw - 1e-6) / ix);
+  const r0 = Math.floor(py0 / iy), r1 = Math.floor((py0 + pw - 1e-6) / iy);
+  const jobs = [];
+  for (let r = Math.max(r0, 0); r <= r1; r++) for (let c = Math.max(c0, 0); c <= c1; c++) {
+    jobs.push((async () => {
+      pending++; updateStatus();
+      try {
+        const bm = await getChunk(k, r, c);
+        if (!bm || signal.aborted) return;
+        // overlap of chunk and tile window, in array pixels
+        const sx0 = Math.max(px0, c * ix), sx1 = Math.min(px0 + pw, (c + 1) * ix);
+        const sy0 = Math.max(py0, r * iy), sy1 = Math.min(py0 + pw, (r + 1) * iy);
+        ctx.drawImage(bm, sx0 - c * ix, sy0 - r * iy, sx1 - sx0, sy1 - sy0,
+          (sx0 - px0) * scale, (sy0 - py0) * scale, (sx1 - sx0) * scale, (sy1 - sy0) * scale);
+      } catch (e) { failed++; console.warn(e); }
+      finally { pending--; updateStatus(); }
+    })());
+  }
+  await Promise.all(jobs);
+  const blob = await canvas.convertToBlob({ type: 'image/png' });
+  return blob.arrayBuffer();
+}
+
+maplibregl.addProtocol('zarr', async (params, abortController) => {
+  const [z, x, y] = params.url.replace('zarr://', '').split('/').map(Number);
+  return { data: await renderTile(z, x, y, abortController.signal) };
+});
+
+// ---------- Map ----------
+(async () => {
+  const bbox = await loadMetadata();
+  statusEl.textContent = 'Idle';
+  // Mercator -> lon/lat
+  const lon = x => x / ORIGIN * 180;
+  const lat = y => Math.atan(Math.sinh(y / ORIGIN * Math.PI)) * 180 / Math.PI;
+  const bounds = [lon(bbox[0]), lat(bbox[1]), lon(bbox[2]), lat(bbox[3])];
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    hash: true,
+    bounds,
+    style: {
+      version: 8,
+      sources: {
+        osm: {
+          type: 'raster', tileSize: 256, maxzoom: 19,
+          tiles: ['https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png'],
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+        },
+        aerial: {
+          type: 'raster', tileSize: TILE, minzoom: 5, maxzoom: MAX_ZOOM, bounds,
+          tiles: ['zarr://{z}/{x}/{y}'],
+          attribution: 'Aerial imagery &copy; <a href="https://www.agea.gov.it/" target="_blank">AGEA</a>, via <a href="https://source.coop/mindearth/italy-aerial" target="_blank">Source Cooperative</a>',
+        },
+      },
+      layers: [
+        { id: 'osm', type: 'raster', source: 'osm' },
+        { id: 'aerial', type: 'raster', source: 'aerial', paint: { 'raster-fade-duration': 150 } },
+      ],
+    },
+  });
+  map.addControl(new maplibregl.NavigationControl());
+  map.addControl(new maplibregl.ScaleControl());
+  map.addControl(new maplibregl.GeolocateControl());
+
+  document.getElementById('opacity').addEventListener('input', e =>
+    map.setPaintProperty('aerial', 'raster-opacity', +e.target.value));
+  document.getElementById('basemap').addEventListener('change', e =>
+    map.setLayoutProperty('osm', 'visibility', e.target.checked ? 'visible' : 'none'));
+})().catch(e => { statusEl.textContent = 'Error: ' + e.message; console.error(e); });
+</script>
+</body>
+</html>
