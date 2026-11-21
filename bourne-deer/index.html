@@ -17,8 +17,8 @@
 <div id="map"></div>
 <div id="panel">
   <b>Bourne, MA – Deer Zone 12</b><br>
-  Red circles: 500 ft around each dwelling. Unshaded areas are where no dwelling is within 500 ft.
-  <label>Opacity <input id="op" type="range" min="0" max="1" step="0.05" value="0.5"></label>
+  Red outline: edge of the area within 500 ft of a dwelling. Outside the outlines (unshaded) is farther than 500 ft from any dwelling.
+  <label>Fill opacity <input id="op" type="range" min="0" max="1" step="0.05" value="0.12"></label>
   <small>Dwellings = buildings on residential parcels (MassGIS). Not legal advice – check regulations, land ownership and permission.</small>
 </div>
 <script>
@@ -33,11 +33,13 @@ const map = new maplibregl.Map({
 });
 map.addControl(new maplibregl.NavigationControl());
 map.on("load", () => {
-  map.addSource("circles", { type: "geojson", data: "bourne_dwelling_circles_500ft.geojson" });
+  map.addSource("circles", { type: "geojson", data: "bourne_dwelling_zone_500ft.geojson" });
   map.addSource("zone", { type: "geojson", data: "wmz12.geojson" });
   map.addLayer({ id: "zone", type: "line", source: "zone", paint: { "line-color": "#ffd400", "line-width": 2 } });
   map.addLayer({ id: "circles", type: "fill", source: "circles",
-    paint: { "fill-color": "#e02020", "fill-opacity": 0.5 } });
+    paint: { "fill-color": "#e02020", "fill-opacity": 0.12 } });
+  map.addLayer({ id: "circles-outline", type: "line", source: "circles",
+    paint: { "line-color": "#ff2a2a", "line-width": 1.8 } });
   document.getElementById("op").oninput = e => map.setPaintProperty("circles", "fill-opacity", +e.target.value);
 });
 </script>

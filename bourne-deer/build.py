@@ -82,3 +82,9 @@ for f in circles:
 json.dump({"type": "FeatureCollection", "features": circles}, open("bourne_dwelling_circles_500ft.geojson", "w"))
 json.dump({"type": "Feature", "properties": {"name": "WMZ 12"}, "geometry": mapping(zone)}, open("wmz12.geojson", "w"))
 print(len(circles), "circles in Zone 12")
+
+# dissolved version: uniform shading where circles overlap, smoother edges
+pts = [g.centroid for g in dwellings if zone_ma.contains(g.centroid)]
+union = transform(to_ll, unary_union([p.buffer(BUFFER_M, 12) for p in pts])).simplify(0.000005)
+json.dump({"type": "Feature", "properties": {"name": "500 ft dwelling zone"},
+           "geometry": mapping(union)}, open("bourne_dwelling_zone_500ft.geojson", "w"))
