@@ -18,7 +18,7 @@
 <div id="panel">
   <b>Bourne, MA – Deer Zone 12</b><br>
   Red outline: edge of the area within 500 ft of a dwelling. Outside the outlines (unshaded) is farther than 500 ft from any dwelling.
-  <label>Fill opacity <input id="op" type="range" min="0" max="1" step="0.05" value="0.12"></label>
+  <label>Fill opacity <input id="op" type="range" min="0" max="1" step="0.05" value="1"></label>
   <small>Dwellings = buildings on residential parcels (MassGIS). Not legal advice – check regulations, land ownership and permission.</small>
 </div>
 <script>
@@ -37,7 +37,7 @@ map.on("load", () => {
   map.addSource("zone", { type: "geojson", data: "wmz12.geojson" });
   map.addLayer({ id: "zone", type: "line", source: "zone", paint: { "line-color": "#ffd400", "line-width": 2 } });
   map.addLayer({ id: "circles", type: "fill", source: "circles",
-    paint: { "fill-color": "#e02020", "fill-opacity": 0.12 } });
+    paint: { "fill-color": "#e02020", "fill-opacity": 1.0 } });
   map.addLayer({ id: "circles-outline", type: "line", source: "circles",
     paint: { "line-color": "#ff2a2a", "line-width": 1.8 } });
   document.getElementById("op").oninput = e => map.setPaintProperty("circles", "fill-opacity", +e.target.value);
